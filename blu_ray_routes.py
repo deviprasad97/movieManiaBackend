@@ -3,6 +3,7 @@ import requests
 from bs4 import BeautifulSoup, NavigableString
 import re
 import json
+import handlers.BluRayGetMediaReleaseDataHandler as blu_ray_handler
 
 app = Flask(__name__)
 
@@ -247,6 +248,7 @@ def configure_blu_ray_routes(app):
             return jsonify({'error': 'UPC is required'}), 400
         
         movie_data = search_upc_helper(upc)
+        print(movie_data)
         if movie_data:
             return jsonify(movie_data)
         
@@ -258,8 +260,11 @@ def configure_blu_ray_routes(app):
         post_data = f"userid=-1&country=US&keyword={upc}"
 
         # Make POST request
-        response = requests.post(url, data=post_data, headers=headers)
-        html_content = response.text
+        try:
+            response = requests.post(url, data=post_data, headers=headers)
+            html_content = response.text
+        except Exception as e:
+            return None
 
         # Parse HTML
         soup = BeautifulSoup(html_content, 'html.parser')
@@ -267,11 +272,19 @@ def configure_blu_ray_routes(app):
         # Extract relevant information
         script_content = soup.find('script', text=re.compile('var ids = new Array'))
         if not script_content:
-            return jsonify({'error': 'Data not found'}), 404
+            return None
 
         ids = re.search("var ids = new Array\((.*?)\);", script_content.string).group(1).strip("'").split("', '")
         urls = re.search("var urls = new Array\((.*?)\);", script_content.string).group(1).strip("'").split("', '")
         images = re.search("var images = new Array\((.*?)\);", script_content.string).group(1).strip("'").split("', '")
+        release_type = ""
+        if '4K-Blu-ray' in urls[0]:
+            release_type = "4K Blu-ray"
+        elif 'Blu-ray' in urls[0]:
+            release_type = "Blu-ray" 
+        elif 'DVD' in urls[0]:
+            release_type = "DVD" 
+
 
         li_element = soup.find('li', id='match0')
         if li_element:
@@ -287,7 +300,8 @@ def configure_blu_ray_routes(app):
                 'id': urls[0].split('/')[-2],
                 'upc': upc,
                 'image_url': images[0],
-                'media_release_date': release_date
+                'media_release_date': release_date,
+                'release_type': release_type
             }
         return None
     
@@ -303,64 +317,6 @@ def configure_blu_ray_routes(app):
         response = requests.get(data_url, headers=headers)
         soup = BeautifulSoup(response.text, 'html.parser')
 
-        def extract_release_info(soup):
-            # Find the target span tag
-            target_span = soup.find(lambda tag: tag.name == "span" and tag.get("class") == ["subheading", "grey"])
-
-            # Initialize variables
-            studio, year, duration, rating, release_date = None, None, None, None, None
-
-            # Iterate over siblings of the target span tag to extract information
-            for sibling in target_span.next_siblings:
-                if sibling.name == "span" and sibling.get("class") == ["subheading", "grey"]:
-                    break  # Stop at the next similar span tag
-
-                if sibling.name == "a" and 'studioid' in sibling.get('href', ''):
-                    studio = sibling.text.strip()
-                elif sibling.name == "a" and 'year' in sibling.get('href', ''):
-                    year = int(sibling.text.strip())
-                elif sibling.name == "span" and sibling.get("id") == "runtime":
-                    duration = sibling.text.strip()
-                elif sibling.name == "a" and 'releasedates' in sibling.get('href', ''):
-                    release_date = sibling.text.strip()
-
-            # The rating is a bit tricky to extract directly; it's part of the sibling text
-            if target_span:
-                remaining_text = target_span.text
-                rating_parts = [part.strip() for part in remaining_text.split('|') if "Rated" in part]
-                rating = rating_parts[0] if rating_parts else None
-
-            # Constructing the information dictionary
-            movie_info = {
-                "Studio": studio,
-                "Year": year,
-                "Duration": duration,
-                "Rating": rating,
-                "Release Date": release_date
-            }
-            return movie_info
-
-        # Function to safely extract text
-        def extract_text(soup, text):
-            # Find the tag containing the text "Discs"
-            discs_tag = soup.find(lambda tag: tag.name == "span" and tag.get("class") == ["subheading"] and text == tag.text)
-            # Initialize a list to hold all the extracted lines
-            info = []
-            try:
-                # Iterate over subsequent siblings until the next <span class="subheading"> tag
-                for sibling in discs_tag.next_siblings:
-                    if sibling.name == "span" and "subheading" in sibling.get('class', []):
-                        break  # Stop at the next subheading
-                    if isinstance(sibling, NavigableString):
-                        info.append(sibling.strip())
-
-                # Filter out empty strings
-                info = [line for line in info if line]
-            except Exception:
-                return info
-
-            return info
-
         genres = [genre.get_text(strip=True) for genre in soup.select('.genreappeal a')]
         images = {}
         for image_type in ['front', 'back', 'slip', 'slipback']:
@@ -368,7 +324,7 @@ def configure_blu_ray_routes(app):
                 image_id = data_url.split('/')[-2]  # Assuming the ID is part of the URL
                 images[image_type] = f"https://images.static-bluray.com/movies/covers/{image_id}_{image_type}.jpg"
 
-        video_details = extract_text(soup=soup, text='Video')
+        video_details = blu_ray_handler.extract_text(soup=soup, text='Video')
 
         # Audio details extraction
         audio_details = []
@@ -382,17 +338,19 @@ def configure_blu_ray_routes(app):
         subtitles_section = soup.find(id='shortsubs')
         if subtitles_section:
             subtitles = [sub.strip() for sub in subtitles_section.text.split(',')]
-
+        imdb_link = soup.find('a', id="imdb_icon")['href']
+        imdb_id = re.search(r'/title/(tt\d+)/', imdb_link).group(1)
         # Discs details extraction
         discs_details = {
-            'Types': extract_text(soup, 'Discs'),
+            'Types': blu_ray_handler.extract_text(soup, 'Discs'),
         }
 
         digital_details = {
-            'AvailableOn': extract_text(soup, 'Digital')
+            'AvailableOn': blu_ray_handler.extract_text(soup, 'Digital')
         }
 
-        playback_details = extract_text(soup, 'Playback')
+        playback_details = blu_ray_handler.extract_text(soup, 'Playback')
+        print(blu_ray_handler.extract_release_info(soup))
 
         response_data = {
             'Movie': {
@@ -407,7 +365,8 @@ def configure_blu_ray_routes(app):
             'Discs': discs_details,
             'Digital': digital_details,
             'Playback': playback_details,
-            'Packaging': extract_text(soup, 'Packaging')
+            'Packaging': blu_ray_handler.extract_text(soup, 'Packaging'),
+            'imdb_id': imdb_id
         }
 
         return jsonify(response_data)
